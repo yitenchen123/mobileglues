@@ -12,6 +12,7 @@
 #include "mg.h"
 #include "texture.h"
 #include "../egl/context.h"
+#include "../egl/sdl_swap_gate.h"
 
 #define DEBUG 0
 
@@ -216,6 +217,11 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
     LOG()
     LOG_D("glDrawElements, mode: %d, count: %d, type: %d, indices: %p", mode, count, type, indices)
+    // Draw-path funnel for the SDL swap-gate repair. This is the point guaranteed
+    // to be reached while the gate is shut, because the failure it repairs is
+    // precisely "draws keep happening, no swap ever arrives" -- see
+    // egl/sdl_swap_gate.h. Costs two relaxed atomic loads on a healthy run.
+    mg_sdl_gate_tick();
     prepareForDraw();
     if (mg_restart_needs_rewrite(type) && mg_draw_elements_restart(mode, count, type, indices, 0, -1)) return;
     const bool restart_fixed = mg_restart_needs_driver_fixed(type);

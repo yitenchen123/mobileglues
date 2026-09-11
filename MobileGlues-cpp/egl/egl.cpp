@@ -14,6 +14,7 @@
 #include "../gles/loader.h"
 #include "../glx/lookup.h"
 #include "loader.h"
+#include "sdl_swap_gate.h"
 #include "trace.h"
 #include <EGL/eglext.h>
 #include <cstdio>
@@ -417,6 +418,12 @@ namespace {
     // and every path that presents a frame has to go through here.
     EGLBoolean presentSurface(EGLDisplay dpy, EGLSurface surface) {
         LOAD_EGL(eglSwapBuffers)
+        // Reaching this function at all is the proof that SDL's swap gate admitted
+        // us: SDL refuses the swap before ever calling the backend when its
+        // thread-local current window does not match. Recording the presentation
+        // here lets the swap-gate repair retire itself (see egl/sdl_swap_gate.h
+        // for the failure it guards against).
+        mg_sdl_gate_note_presented();
         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
             return egl_eglSwapBuffers(dpy, surface);
         }
@@ -828,7 +835,15 @@ extern "C"
         }
         // Only on success: a failed make-current leaves the previous context
         // current, so re-pointing the record would describe the wrong one.
-        if (result == EGL_TRUE) mg_context_make_current(dpy, draw, read, ctx);
+        if (result == EGL_TRUE) {
+            mg_context_make_current(dpy, draw, read, ctx);
+            // The gate can already be shut at this point: SDL writes its TLS only
+            // when its own MakeCurrent reports success, and its EGL layer reports
+            // success unconditionally. Checking after a real bind is the earliest
+            // moment this library knows a context is genuinely current, which is
+            // the precondition for restating the bind on SDL's behalf.
+            mg_sdl_gate_maybe_repair();
+        }
         return result;
     }
 

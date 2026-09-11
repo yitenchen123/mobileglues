@@ -121,6 +121,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     glx/lookup.cpp
     egl/egl.cpp
     egl/loader.cpp
+    egl/sdl_swap_gate.cpp
     gles/loader.cpp
     config/cJSON.c
     config/config.cpp

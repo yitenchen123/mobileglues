@@ -9,6 +9,7 @@
 #include "config/stats.h"
 #include "egl/egl.h"
 #include "egl/loader.h"
+#include "egl/sdl_swap_gate.h"
 #include "gl/envvars.h"
 #include "gl/gl.h"
 #include "gl/log.h"
@@ -70,6 +71,11 @@ void proc_init() {
     set_multidraw_setting();
 
     init_settings_post();
+
+    // One line saying whether SDL is loaded, and whether its swap gate is open.
+    // Recorded before the game starts rendering, so a log that later shows no
+    // eglSwapBuffers at all can be read against what the premise was at startup.
+    mg_sdl_gate_probe("proc_init");
 
 #if PROFILING
     init_perfetto();
