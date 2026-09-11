@@ -125,6 +125,29 @@ void* open_lib(const char** names, const char* override, bool* used_override) {
     return lib;
 }
 
+// On Apple this library is built against two frameworks of its own --
+// `-framework libEGL -framework libGLESv2` in the CMakeLists -- so the egl* and
+// gl* entry points this file has to resolve live inside the image that is
+// already loaded, the one carrying this code. The way to reach them is to ask
+// the loader for *that image by name*, not to ask for "whatever answers to this
+// symbol".
+//
+// RTLD_NOLOAD is the whole trick: it claims an image that is already mapped and
+// changes nothing about it. A plain dlopen of the same path would return the
+// same handle and be harmless, but RTLD_NOLOAD states the intent, and it cannot
+// accidentally load a *second* copy of a framework the app has already put in
+// the process -- which for libGLESv2 would mean two sets of driver state.
+//
+// This mirrors egl/sdl_swap_gate.cpp's OpenSdlIfLoaded() and Amethyst's own
+// ame_rendererHandle(), both of which solve the same problem the same way.
+static void* claim_linked_image(const char* path) {
+    void* handle = dlopen(path, RTLD_NOW | RTLD_NOLOAD);
+    if (handle != nullptr) return handle;
+    // Not mapped yet. Loading it here is correct and still local: this library
+    // needs the framework whether or not anyone else wanted it first.
+    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+
 void load_libs() {
 #ifndef __APPLE__
     const bool want_angle = global_settings.angle == AngleMode::Enabled;
@@ -162,8 +185,43 @@ void load_libs() {
         LOG_E("ANGLE was requested but was not loaded; running on the system driver\n")
     }
 #else
-    gles = (void*)(~(uintptr_t)0);
-    egl = (void*)(~(uintptr_t)0);
+    // This branch used to be two lines handing both names `(void*)(~0)`:
+    //
+    //     gles = (void*)(~(uintptr_t)0);
+    //     egl  = (void*)(~(uintptr_t)0);
+    //
+    // with the comment calling that RTLD_DEFAULT. It is not, and the difference
+    // is the whole bug. From Apple's dlfcn.h:
+    //
+    //     #define RTLD_NEXT     ((void *) -1)  /* Search subsequent objects. */
+    //     #define RTLD_DEFAULT  ((void *) -2)  /* Use default search algorithm. */
+    //
+    // `~(uintptr_t)0` is -1. So those two lines asked for RTLD_NEXT -- "the
+    // images loaded *after* this one" -- a set that by construction cannot
+    // contain the libEGL.framework this library is linked against, because that
+    // was mapped before it. Not one of the thirteen entry points
+    // init_target_egl() asks for can ever be found, on any device, whatever the
+    // launcher has loaded. That is the field log exactly: thirteen lines of
+    // "EGL entry point egl<name> is not available in the backend library",
+    // then the crash of an EGL layer that has no EGL.
+    //
+    // (The launcher does load this dylib RTLD_LOCAL -- Amethyst, gl_bridge.m,
+    // chooses that on purpose so a renderer cannot leak its symbols into the
+    // process -- but that is a second, independent reason the lookup fails, not
+    // the reason the field log looks the way it does. RTLD_NEXT alone explains
+    // it.)
+    //
+    // What we want is the image that already contains this function, reached by
+    // the name its linked frameworks have. Claim them.
+    egl = claim_linked_image("@rpath/libEGL.framework/libEGL");
+    gles = claim_linked_image("@rpath/libGLESv2.framework/libGLESv2");
+    // LOG_W_FORCE expands to a braced block, not a statement, so it cannot sit
+    // inside a braceless `if`. Bail out first and log after.
+    const bool frameworks_missing = (egl == nullptr || gles == nullptr);
+    if (frameworks_missing) {
+        LOG_W_FORCE("the EGL/GLES frameworks this build links could not be opened "
+                    "(egl=%p, gles=%p)", egl, gles)
+    }
 #endif
 }
 

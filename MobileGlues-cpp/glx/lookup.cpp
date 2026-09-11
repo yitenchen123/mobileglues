@@ -51,7 +51,18 @@ void* glXGetProcAddress(const char* name) {
     LOG()
     std::string real_func_name = handle_multidraw_func_name(std::string(name));
 #ifdef __APPLE__
-    return dlsym((void*)(~(uintptr_t)0), real_func_name.c_str());
+    // The gles handle, not RTLD_NEXT.
+    //
+    // This used to be `dlsym((void*)(~(uintptr_t)0), ...)`, with a comment
+    // calling that RTLD_DEFAULT. It is not: on Darwin RTLD_DEFAULT is
+    // (void*)-2 and (void*)-1 is RTLD_NEXT, "images loaded after the caller".
+    // Asked that way the lookup can only ever miss, which on a phone with no
+    // log to read looks the same as "this driver does not have the entry
+    // point". The handle gles/loader.cpp settled on is the right one, and it is
+    // the same handle the rest of the library resolves through.
+    extern void* gles; // gles/loader.cpp
+    if (gles == nullptr) return nullptr;
+    return dlsym(gles, real_func_name.c_str());
 #else
 
     void* proc = nullptr;
