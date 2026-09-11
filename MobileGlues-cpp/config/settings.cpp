@@ -58,6 +58,9 @@ void init_settings() {
         success ? static_cast<FSR1_Quality_Preset>(config_get_int("fsr1Setting")) : FSR1_Quality_Preset::Disabled;
     HideMGEnvLevel hideMGEnvLevel =
         success ? static_cast<HideMGEnvLevel>(config_get_int("hideMGEnvLevel")) : HideMGEnvLevel::Disabled;
+    // Absent means keep it, which is the behaviour this layer wants on every host:
+    // a thread with no context has no other way to get a true answer.
+    bool keepBootstrapContext = success ? (config_get_int("keepBootstrapContext") != 0) : true;
 
     if (customGLVersionInt < 0) {
         customGLVersionInt = 0;
@@ -184,6 +187,7 @@ void init_settings() {
     global_settings.angle_supported = isANGLESupported;
     LOG_D("Final ANGLE setting: %d", static_cast<int>(global_settings.angle))
     global_settings.buffer_coherent_as_flush = (global_settings.angle == AngleMode::Disabled);
+    global_settings.keep_bootstrap_context = keepBootstrapContext;
 
     if (global_settings.angle == AngleMode::Enabled) {
         // setenv("LIBGL_GLES", "libGLESv2_angle.so", 1);
@@ -233,6 +237,8 @@ void init_settings() {
           static_cast<int>(global_settings.angle_depth_clear_fix_mode))
     LOG_V("[MobileGlues] Setting: bufferCoherentAsFlush       = %i",
           static_cast<int>(global_settings.buffer_coherent_as_flush))
+    LOG_V("[MobileGlues] Setting: keepBootstrapContext        = %i",
+          static_cast<int>(global_settings.keep_bootstrap_context))
     if (global_settings.custom_gl_version.isEmpty()) {
         LOG_V("[MobileGlues] Setting: customGLVersion             = (default)");
     } else {
@@ -714,6 +720,8 @@ std::string dump_settings_string(std::string prefix) {
        << "\n";
 
     ss << prefix << "BufferCoherentAsFlush: " << (global_settings.buffer_coherent_as_flush ? "True" : "False") << "\n";
+
+    ss << prefix << "KeepBootstrapContext: " << (global_settings.keep_bootstrap_context ? "True" : "False") << "\n";
 
     ss << prefix << "CustomGLVersion: "
        << ((GLVersion.toInt(2) == DEFAULT_GL_VERSION) ? "(Default)" : std::to_string(GLVersion.toInt(2))) << "\n";

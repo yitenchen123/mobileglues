@@ -11,6 +11,7 @@
 #include "log.h"
 #include "mg.h"
 #include "../egl/context.h"
+#include "../egl/loader.h"
 #include <cstring>
 
 #define DEBUG 0
@@ -634,7 +635,18 @@ extern "C"
             *data = ival;
             return;
         }
+        // Same silent-zero hazard as the default branch of glGetIntegerv, and the
+        // 64-bit form is what a caller uses for sizes and alignments. Zero the
+        // destination first so a driver that leaves it alone cannot be mistaken for
+        // a driver that answered, then retry with the bootstrap context bound.
+        *data = 0;
         GLES.glGetInteger64v(pname, data);
+        if (*data != 0) return;
+
+        if (BindFallbackEGLContextIfNeeded()) {
+            GLES.glGetInteger64v(pname, data);
+            UnbindFallbackEGLContext();
+        }
     }
 
     // How many values glGetFloatv writes for a pname. Anything not listed writes

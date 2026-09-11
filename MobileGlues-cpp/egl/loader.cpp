@@ -22,6 +22,14 @@ static EGLDisplay eglDisplay = EGL_NO_DISPLAY;
 static EGLSurface eglSurface = EGL_NO_SURFACE;
 static EGLContext eglContext = EGL_NO_CONTEXT;
 
+// The bootstrap context in its role as a fallback for context-less threads.
+// Separate from the three above, which belong to the probe and are cleared by
+// destroy_temp_egl_ctx on the failure path.
+static EGLDisplay g_fallback_display = EGL_NO_DISPLAY;
+static EGLSurface g_fallback_surface = EGL_NO_SURFACE;
+static EGLContext g_fallback_context = EGL_NO_CONTEXT;
+static bool g_fallback_available = false;
+
 void init_target_egl() {
     ETRACE("init_target_egl: starting the bootstrap probe")
     LOAD_EGL(eglGetProcAddress);
@@ -149,9 +157,85 @@ cleanup:
     ETRACE("init_target_egl: probe FAILED, all three handles released")
 }
 
+// The bootstrap context is kept, not destroyed.
+//
+// It used to be torn down at the end of proc_init, which left the process with a
+// driver that answers nothing on any thread that has not since bound a context of
+// its own. A query from such a thread does not fail loudly: glGetIntegerv leaves
+// the caller's buffer alone (so a zeroed LWJGL buffer stays zero) and glGetString
+// returns NULL. Minecraft 26.3 divides by one of those zeros and crashes, and
+// calls strlen on the NULL and crashes, and both have been reported in the field.
+//
+// Keeping one small pbuffer context alive costs a 32x32 surface and gives every
+// thread a way to ask the driver a question and get a true answer. It is bound
+// only for the duration of a query that would otherwise have no context, and
+// released only if this layer was the one that bound it -- see
+// BindFallbackEGLContextIfNeeded.
+//
+// destroy_temp_egl_ctx remains for the failure path in init_target_egl, which
+// still has to release the display when the probe did not come up.
+void mg_keep_bootstrap_context() {
+    ETRACE("mg_keep_bootstrap_context: keeping dpy=%p, ctx=%p, surface=%p for context-less query threads",
+           eglDisplay, eglContext, eglSurface)
+    g_fallback_display = eglDisplay;
+    g_fallback_context = eglContext;
+    g_fallback_surface = eglSurface;
+    g_fallback_available = (eglDisplay != EGL_NO_DISPLAY && eglContext != EGL_NO_CONTEXT);
+}
+
+// Bind the bootstrap context, but only if this thread has none.
+//
+// Returns true when this call is the one that bound it, and the caller must then
+// pass the same value to Unbind. A thread that already had a context is left
+// alone: its own context describes the surface it is really rendering to, and
+// swapping it out for a pbuffer mid-frame would be a far worse bug than the NULL
+// this exists to avoid.
+bool BindFallbackEGLContextIfNeeded() {
+    if (!g_fallback_available) return false;
+    // g_current_ctx is written only by eglMakeCurrent, so it is exactly the
+    // question being asked: does this thread already have a context of its own?
+    if (g_current_ctx != nullptr) return false;
+
+    LOAD_EGL(eglMakeCurrent);
+    if (egl_eglMakeCurrent == nullptr) return false;
+
+    if (!egl_eglMakeCurrent(g_fallback_display, g_fallback_surface, g_fallback_surface, g_fallback_context)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_E("the bootstrap context could not be bound on a thread that has none, so a query from this thread "
+                  "will reach a driver with no current context and may answer nothing")
+        }
+        return false;
+    }
+    return true;
+}
+
+void UnbindFallbackEGLContext() {
+    if (!g_fallback_available) return;
+
+    LOAD_EGL(eglMakeCurrent);
+    if (egl_eglMakeCurrent == nullptr) return;
+
+    // Releasing through eglMakeCurrent is what the host expects. The bootstrap
+    // handles themselves stay alive for the next thread that asks; only this
+    // thread's binding goes away.
+    egl_eglMakeCurrent(g_fallback_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+}
+
 void destroy_temp_egl_ctx() {
     ETRACE("destroy_temp_egl_ctx: dpy=%p, ctx=%p, surface=%p", eglDisplay, eglContext, eglSurface)
     if (eglDisplay == EGL_NO_DISPLAY) return;
+
+    // The handles may already have been promoted to the shared fallback set by
+    // mg_keep_bootstrap_context. Destroying them here would then leave that set
+    // naming dead handles, so drop the promotion first.
+    if (g_fallback_display == eglDisplay) {
+        g_fallback_display = EGL_NO_DISPLAY;
+        g_fallback_context = EGL_NO_CONTEXT;
+        g_fallback_surface = EGL_NO_SURFACE;
+        g_fallback_available = false;
+    }
 
     LOAD_EGL(eglDestroySurface);
     LOAD_EGL(eglDestroyContext);

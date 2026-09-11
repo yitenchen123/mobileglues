@@ -8,6 +8,7 @@
 #include "getter.h"
 #include "enable.h"
 #include "../egl/context.h"
+#include "../egl/loader.h"
 #include "buffer.h"
 #include "texture.h"
 #include <string>
@@ -28,6 +29,119 @@ Version GLVersion;
 namespace {
 // See mg_set_gl_error in gl/mg.h for why this exists and why it is per thread.
 thread_local GLenum g_frontend_error = GL_NO_ERROR;
+
+// Asking the driver a question it cannot answer, and what to do about it.
+//
+// A thread with no current EGL context does not get an error from a host GLES
+// driver, it gets silence: glGetIntegerv leaves the caller's buffer exactly as it
+// found it, and glGetString returns NULL. Both are legal (ES 3.2: "If an error is
+// generated, glGetString returns 0") and both have taken Minecraft 26.3 down.
+//
+//   - DynamicGpuDataStorageMapped's constructor reads
+//     limits().minUniformOffsetAlignment() and divides by it through
+//     Mth.roundToward. GlHeuristics asks for 0x8A34
+//     (GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT); this layer had no case for that pname
+//     and forwarded it, the thread had no context, LWJGL's zeroed buffer stayed
+//     zero, and the game died on an integer divide by zero.
+//   - GlDevice's first query is GL_RENDERER, and constructing a std::string from
+//     the NULL it got is strlen(nullptr). backend_string, further down this file,
+//     already answers that one from the probe-time copy.
+//
+// So every host integer query that can legitimately come back unanswered goes
+// through QueryHostInt: try the driver as-is (the common path, and it costs
+// nothing extra), then once more with the bootstrap context bound if this thread
+// had none, and only then substitute a value from the table below — logged, so
+// the log names the pname instead of leaving the next reader to guess which
+// limit was wrong.
+
+struct limit_fallback_t {
+    GLenum pname;
+    GLint value;
+};
+
+// Minimums a conforming ES 3.2 driver must honour, for the limits where a wrong
+// small number is worse than a wrong large one. Where the spec mandates no floor
+// the value is a conservative typical one.
+constexpr limit_fallback_t k_limit_fallbacks[] = {
+    // Offset alignments. The application divides by these: too small is caught by
+    // the driver, zero is a crash, and a power of two is what drivers report.
+    //
+    // Three, not four. There is no GL_ATOMIC_COUNTER_BUFFER_OFFSET_ALIGNMENT —
+    // it is not in the Khronos registry at all, so an entry for it would be a
+    // pname no application can ask for. (Writing one from memory got 0x8A35,
+    // which is GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH.)
+    {GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, 256},
+    {GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, 256},
+    {GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT, 256},
+    // ES 3.2 mandated maxima, and the binding counts the spec fixes.
+    {GL_MAX_UNIFORM_BUFFER_BINDINGS, 24},
+    {GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, 8},
+    {GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS, 1},
+    {GL_MAX_TEXTURE_BUFFER_SIZE, 65536},
+    {GL_MAX_UNIFORM_BLOCK_SIZE, 16384},
+    {GL_MAX_TEXTURE_IMAGE_UNITS, 16},
+    {GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, 16},
+    {GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, 32},
+    {GL_MAX_VERTEX_ATTRIBS, 16},
+    {GL_MAX_VERTEX_UNIFORM_VECTORS, 256},
+    {GL_MAX_FRAGMENT_UNIFORM_VECTORS, 224},
+    {GL_MAX_VARYING_VECTORS, 15},
+    {GL_MAX_RENDERBUFFER_SIZE, 2048},
+    {GL_MAX_ELEMENTS_INDICES, 0},
+    {GL_MAX_ELEMENTS_VERTICES, 0},
+    {GL_MAX_DRAW_BUFFERS, 4},
+    {GL_MAX_COLOR_ATTACHMENTS, 4},
+    {GL_SAMPLES, 4},
+};
+
+bool limit_fallback(GLenum pname, GLint* out) {
+    for (const auto& f : k_limit_fallbacks) {
+        if (f.pname == pname) {
+            *out = f.value;
+            return true;
+        }
+    }
+    return false;
+}
+
+// One host integer query, with a context guaranteed for it and an answer
+// guaranteed after it.
+//
+// `params` is zeroed before the driver is asked. The driver leaving it alone is
+// the failure being guarded against, so a value that survives must be one this
+// layer chose rather than whatever the caller last had in that slot.
+void QueryHostInt(GLenum pname, GLint* params) {
+    if (params == nullptr) return;
+    *params = 0;
+
+    GLES.glGetIntegerv(pname, params);
+    if (*params != 0) return;
+
+    // Zero is not proof of failure — some limits really are zero, and GL_NONE-like
+    // answers exist — so the retry has to be cheap and the substitution has to be
+    // the last resort. A thread that already has a context gets no retry at all:
+    // for it the zero is the driver's real answer.
+    const bool bound_here = BindFallbackEGLContextIfNeeded();
+    if (bound_here) {
+        GLES.glGetIntegerv(pname, params);
+        UnbindFallbackEGLContext();
+        if (*params != 0) return;
+    }
+
+    GLint fallback = 0;
+    if (limit_fallback(pname, &fallback) && fallback != 0) {
+        static int warned = 0;
+        if (warned < 32) {
+            warned++;
+            LOG_E("glGetIntegerv(%s): the driver answered 0%s, substituting %d. A zero here is a divisor or a "
+                  "rounding modulus in the application.",
+                  glEnumToString(pname), bound_here ? " even with a context bound" : " with no context on this "
+                                                    "thread to bind",
+                  fallback)
+        }
+        *params = fallback;
+    }
+}
 } // namespace
 
 void mg_set_gl_error(GLenum error) {
@@ -173,7 +287,10 @@ void glGetIntegerv(GLenum pname, GLint* params) {
             LOG_D("  -> %d", *params)
             break;
         }
-        GLES.glGetIntegerv(pname, params);
+        // Goes through the guard rather than straight to the driver: this is the
+        // branch every pname this layer does not own lands on, and a silent zero
+        // from a thread with no context is how Minecraft 26.3 divides by zero.
+        QueryHostInt(pname, params);
         LOG_D("  -> %d", *params)
         CHECK_GL_ERROR
     }

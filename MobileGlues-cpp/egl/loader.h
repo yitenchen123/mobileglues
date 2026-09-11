@@ -194,6 +194,15 @@ extern "C"
     void init_target_egl();
     void destroy_temp_egl_ctx();
 
+    // Keep the bootstrap context instead of destroying it, and expose it as a
+    // fallback for threads that have none. See mg_keep_bootstrap_context in
+    // loader.cpp for why a context-less thread cannot be left to query the driver
+    // directly: it gets a NULL string or an untouched buffer, and the two
+    // Minecraft 26.3 crashes that follow from those are already in the field.
+    void mg_keep_bootstrap_context();
+    bool BindFallbackEGLContextIfNeeded();
+    void UnbindFallbackEGLContext();
+
 #ifdef __cplusplus
 }
 #endif

@@ -81,9 +81,19 @@ void proc_init() {
     init_perfetto();
 #endif
 
-    // Cleanup
+    // Keep the bootstrap context rather than tearing it down.
+    //
+    // It is the only context this process owns that is guaranteed to exist before
+    // the game creates any, and keeping it is what lets a query from a thread with
+    // no context reach a driver that will answer. Destroying it is how a NULL
+    // glGetString and a zeroed glGetIntegerv reach Minecraft 26.3, which crashes on
+    // both. Set keepBootstrapContext to 0 to restore the teardown for comparison.
 #ifndef __APPLE__
-    destroy_temp_egl_ctx();
+    if (global_settings.keep_bootstrap_context) {
+        mg_keep_bootstrap_context();
+    } else {
+        destroy_temp_egl_ctx();
+    }
 #endif
     g_initialized = 1;
 }

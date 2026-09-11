@@ -10,6 +10,11 @@
 #include "../gl/log.h"
 #include "../includes.h"
 
+// gl/log.h's LOG_D expands to `if (DEBUG || GLOBAL_DEBUG)`, so DEBUG has to be
+// defined before it is included. Every other translation unit in this tree does
+// the same.
+#define DEBUG 0
+
 #include <atomic>
 #include <dlfcn.h>
 #include <EGL/egl.h>
